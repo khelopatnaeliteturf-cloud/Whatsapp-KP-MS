@@ -7,12 +7,10 @@ const qrcode = require('qrcode');
 const { Pool } = require('pg');
 require('dotenv').config();
 
-// Force IPv4 first DNS lookup to prevent ENETUNREACH on cloud environments
 if (dns.setDefaultResultOrder) {
     dns.setDefaultResultOrder('ipv4first');
 }
 
-// Global crypto shim for Node 18+ Baileys compatibility
 if (!globalThis.crypto) {
     globalThis.crypto = require('crypto').webcrypto;
 }
@@ -25,11 +23,6 @@ const PORT = process.env.PORT || 3001;
 const WA_API_SECRET = process.env.WA_API_SECRET || '';
 const MAIN_BACKEND_URL = process.env.MAIN_BACKEND_URL || 'https://api.khelopatna.in';
 const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL || process.env.DATABASE_URL;
-
-if (!SUPABASE_DB_URL) {
-    console.error('CRITICAL ERROR: SUPABASE_DB_URL or DATABASE_URL environment variable is missing.');
-    process.exit(1);
-}
 
 const dbPool = new Pool({
     connectionString: SUPABASE_DB_URL,
@@ -58,9 +51,7 @@ async function ensureSessionTable() {
     }
 }
 
-/**
- * Custom Supabase PostgreSQL Auth State Provider for Baileys
- */
+// Custom Supabase PostgreSQL Auth State Provider for Baileys
 async function useSupabaseAuthState() {
     await ensureSessionTable();
     const { initAuthCreds, BufferJSON } = await import('@whiskeysockets/baileys');
@@ -151,12 +142,9 @@ async function useSupabaseAuthState() {
     };
 }
 
-/**
- * Initialize Baileys WhatsApp Socket Connection
- */
 async function initWhatsApp() {
     try {
-        console.log('Initializing KheloPatna Standalone Baileys WhatsApp Microservice...');
+        console.log('Initializing Standalone Baileys WhatsApp Service...');
         connectionStatus = 'CONNECTING';
 
         const { state, saveCreds } = await useSupabaseAuthState();
@@ -184,7 +172,7 @@ async function initWhatsApp() {
                 try {
                     qrCodeImage = await qrcode.toDataURL(qr);
                     connectionStatus = 'DISCONNECTED';
-                    console.log('📱 New WhatsApp QR Code generated for scanning.');
+                    console.log('📱 New WhatsApp QR Code generated.');
                 } catch (e) {
                     console.error('Failed to render QR Code:', e);
                 }
@@ -193,7 +181,7 @@ async function initWhatsApp() {
             if (connection === 'open') {
                 connectionStatus = 'CONNECTED';
                 qrCodeImage = null;
-                console.log('✅ WhatsApp Baileys socket connected successfully and listening!');
+                console.log('✅ WhatsApp Baileys connected successfully and listening!');
             }
 
             if (connection === 'close') {
@@ -204,15 +192,15 @@ async function initWhatsApp() {
                 connectionStatus = 'DISCONNECTED';
 
                 if (isLoggedOut || statusCode === 405) {
-                    console.log(`StatusCode ${statusCode} detected. Cleaning stale session credentials from database to issue fresh QR code...`);
+                    console.log(`StatusCode ${statusCode} detected. Cleaning stale session credentials from database...`);
                     try {
                         await dbPool.query('DELETE FROM whatsapp_session');
                     } catch (e) {
-                        console.error('Error wiping session from database:', e);
+                        console.error('Error wiping session:', e);
                     }
                     qrCodeImage = null;
                 }
-                
+
                 setTimeout(initWhatsApp, 4000);
             }
         });
@@ -229,7 +217,7 @@ async function initWhatsApp() {
                 const rawJid = message.key.remoteJid;
                 if (!rawJid || rawJid.endsWith('@g.us') || rawJid === 'status@broadcast') continue;
 
-                const phone = rawJid; // Keep full JID for accurate routing (handles @lid and @s.whatsapp.net)
+                const phone = rawJid; // Keep full JID for accurate routing
                 const msg = message.message?.ephemeralMessage?.message || message.message?.viewOnceMessage?.message || message.message;
                 const text = msg.conversation || msg.extendedTextMessage?.text || msg.imageMessage?.caption || '';
 
@@ -240,7 +228,7 @@ async function initWhatsApp() {
                     const baseUrl = MAIN_BACKEND_URL.replace(/\/+$/, '');
                     const primaryWebhook = `${baseUrl}/api/whatsapp/webhook`;
                     const payload = { phone, text, secret: WA_API_SECRET };
-                    const config = { headers: { 'X-WA-Secret': WA_API_SECRET }, timeout: 10000 };
+                    const config = { headers: { 'X-WA-Secret': WA_API_SECRET }, timeout: 30000 };
 
                     try {
                         await axios.post(primaryWebhook, payload, config);
@@ -262,6 +250,14 @@ async function initWhatsApp() {
         console.error('Error in WhatsApp initialization:', err);
     }
 }
+
+// Render Keep-Alive Pinger to keep main backend and microservice awake 24/7
+setInterval(() => {
+    if (MAIN_BACKEND_URL) {
+        const pingUrl = `${MAIN_BACKEND_URL.replace(/\/+$/, '')}/api/admin/whatsapp/status`;
+        axios.get(pingUrl).catch(() => {});
+    }
+}, 4 * 60 * 1000);
 
 // Middleware to authenticate microservice API requests
 function authSecret(req, res, next) {
@@ -310,30 +306,45 @@ app.post('/send-text', authSecret, async (req, res) => {
             }
         }
 
-        await sock.sendMessage(jid, { text: message });
-        console.log(`[Baileys Microservice] Sent text to ${jid}`);
-        res.json({ success: true, recipient: jid });
+        try {
+            await sock.sendMessage(jid, { text: message });
+            console.log(`[Baileys Microservice] Sent text to ${jid}`);
+            res.json({ success: true, recipient: jid });
+        } catch (sendErr) {
+            console.warn(`[Baileys Microservice] Direct send to ${jid} failed (${sendErr.message}). Attempting fallback routing...`);
+            if (jid.endsWith('@lid')) {
+                const rawDigits = jid.split('@')[0].replace(/\D/g, '');
+                if (rawDigits.length >= 10) {
+                    let formatted = rawDigits.length === 10 ? '91' + rawDigits : rawDigits;
+                    const fallbackJid = `${formatted}@s.whatsapp.net`;
+                    await sock.sendMessage(fallbackJid, { text: message });
+                    console.log(`[Baileys Microservice] Sent text via fallback to ${fallbackJid}`);
+                    return res.json({ success: true, recipient: fallbackJid, fallbackUsed: true });
+                }
+            }
+            throw sendErr;
+        }
     } catch (err) {
-        console.error('Error sending message:', err);
+        console.error('Error sending message:', err.message || err);
         res.status(500).json({ error: err.message || 'Failed to send WhatsApp message' });
     }
 });
 
 app.post('/disconnect', authSecret, async (req, res) => {
     try {
-        console.log('Resetting WhatsApp session credentials...');
+        console.log('Resetting WhatsApp session...');
         await dbPool.query('DELETE FROM whatsapp_session');
         if (sock) {
             try { sock.end(); } catch (e) {}
         }
         initWhatsApp();
-        res.json({ success: true, message: 'Session reset initiated. Scan QR code to re-pair.' });
+        res.json({ success: true, message: 'Session reset initiated.' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`🚀 KheloPatna Baileys WhatsApp Microservice running on port ${PORT}`);
+    console.log(`🚀 Standalone Baileys WhatsApp Microservice running on port ${PORT}`);
     initWhatsApp();
 });
