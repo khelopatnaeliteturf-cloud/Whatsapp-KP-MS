@@ -7,10 +7,12 @@ const qrcode = require('qrcode');
 const { Pool } = require('pg');
 require('dotenv').config();
 
+// Force IPv4 first DNS lookup to prevent ENETUNREACH on cloud environments
 if (dns.setDefaultResultOrder) {
     dns.setDefaultResultOrder('ipv4first');
 }
 
+// Global crypto shim for Node 18+ Baileys compatibility
 if (!globalThis.crypto) {
     globalThis.crypto = require('crypto').webcrypto;
 }
@@ -23,6 +25,11 @@ const PORT = process.env.PORT || 3001;
 const WA_API_SECRET = process.env.WA_API_SECRET || '';
 const MAIN_BACKEND_URL = process.env.MAIN_BACKEND_URL || 'https://api.khelopatna.in';
 const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL || process.env.DATABASE_URL;
+
+if (!SUPABASE_DB_URL) {
+    console.error('CRITICAL ERROR: SUPABASE_DB_URL or DATABASE_URL environment variable is missing.');
+    process.exit(1);
+}
 
 const dbPool = new Pool({
     connectionString: SUPABASE_DB_URL,
@@ -51,7 +58,9 @@ async function ensureSessionTable() {
     }
 }
 
-// Custom Supabase PostgreSQL Auth State Provider for Baileys
+/**
+ * Custom Supabase PostgreSQL Auth State Provider for Baileys
+ */
 async function useSupabaseAuthState() {
     await ensureSessionTable();
     const { initAuthCreds, BufferJSON } = await import('@whiskeysockets/baileys');
@@ -142,9 +151,12 @@ async function useSupabaseAuthState() {
     };
 }
 
+/**
+ * Initialize Baileys WhatsApp Socket Connection
+ */
 async function initWhatsApp() {
     try {
-        console.log('Initializing Standalone Baileys WhatsApp Service...');
+        console.log('Initializing KheloPatna Standalone Baileys WhatsApp Microservice...');
         connectionStatus = 'CONNECTING';
 
         const { state, saveCreds } = await useSupabaseAuthState();
@@ -156,13 +168,21 @@ async function initWhatsApp() {
         const { version, isLatest } = await baileys.fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1015901307], isLatest: false }));
         console.log(`Using WhatsApp Web Version: ${Array.isArray(version) ? version.join('.') : version} (isLatest: ${isLatest})`);
 
+        const msgStore = new Map();
+
         sock = makeWASocket({
             version,
             logger: pino({ level: 'silent' }),
             printQRInTerminal: false,
             auth: state,
             browser: (Browsers && Browsers.ubuntu) ? Browsers.ubuntu('Chrome') : ['Ubuntu', 'Chrome', '110.0.5563.146'],
-            syncFullHistory: false
+            syncFullHistory: false,
+            getMessage: async (key) => {
+                if (key?.id && msgStore.has(key.id)) {
+                    return msgStore.get(key.id)?.message;
+                }
+                return { conversation: 'Hello' };
+            }
         });
 
         sock.ev.on('connection.update', async (update) => {
@@ -172,7 +192,7 @@ async function initWhatsApp() {
                 try {
                     qrCodeImage = await qrcode.toDataURL(qr);
                     connectionStatus = 'DISCONNECTED';
-                    console.log('📱 New WhatsApp QR Code generated.');
+                    console.log('📱 New WhatsApp QR Code generated for scanning.');
                 } catch (e) {
                     console.error('Failed to render QR Code:', e);
                 }
@@ -181,7 +201,7 @@ async function initWhatsApp() {
             if (connection === 'open') {
                 connectionStatus = 'CONNECTED';
                 qrCodeImage = null;
-                console.log('✅ WhatsApp Baileys connected successfully and listening!');
+                console.log('✅ WhatsApp Baileys socket connected successfully and listening!');
             }
 
             if (connection === 'close') {
@@ -192,15 +212,15 @@ async function initWhatsApp() {
                 connectionStatus = 'DISCONNECTED';
 
                 if (isLoggedOut || statusCode === 405) {
-                    console.log(`StatusCode ${statusCode} detected. Cleaning stale session credentials from database...`);
+                    console.log(`StatusCode ${statusCode} detected. Cleaning stale session credentials from database to issue fresh QR code...`);
                     try {
                         await dbPool.query('DELETE FROM whatsapp_session');
                     } catch (e) {
-                        console.error('Error wiping session:', e);
+                        console.error('Error wiping session from database:', e);
                     }
                     qrCodeImage = null;
                 }
-
+                
                 setTimeout(initWhatsApp, 4000);
             }
         });
@@ -212,12 +232,20 @@ async function initWhatsApp() {
             if (!botEnabled || m.type !== 'notify') return;
 
             for (const message of m.messages) {
+                if (message.key?.id && message.message) {
+                    msgStore.set(message.key.id, message);
+                    if (msgStore.size > 1000) {
+                        const firstKey = msgStore.keys().next().value;
+                        msgStore.delete(firstKey);
+                    }
+                }
+
                 if (message.key.fromMe) continue;
 
                 const rawJid = message.key.remoteJid;
                 if (!rawJid || rawJid.endsWith('@g.us') || rawJid === 'status@broadcast') continue;
 
-                const phone = rawJid; // Keep full JID for accurate routing
+                const phone = rawJid; // Keep full JID for accurate routing (handles @lid and @s.whatsapp.net)
                 const msg = message.message?.ephemeralMessage?.message || message.message?.viewOnceMessage?.message || message.message;
                 const text = msg.conversation || msg.extendedTextMessage?.text || msg.imageMessage?.caption || '';
 
@@ -332,19 +360,19 @@ app.post('/send-text', authSecret, async (req, res) => {
 
 app.post('/disconnect', authSecret, async (req, res) => {
     try {
-        console.log('Resetting WhatsApp session...');
+        console.log('Resetting WhatsApp session credentials...');
         await dbPool.query('DELETE FROM whatsapp_session');
         if (sock) {
             try { sock.end(); } catch (e) {}
         }
         initWhatsApp();
-        res.json({ success: true, message: 'Session reset initiated.' });
+        res.json({ success: true, message: 'Session reset initiated. Scan QR code to re-pair.' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`🚀 Standalone Baileys WhatsApp Microservice running on port ${PORT}`);
+    console.log(`🚀 KheloPatna Baileys WhatsApp Microservice running on port ${PORT}`);
     initWhatsApp();
 });
